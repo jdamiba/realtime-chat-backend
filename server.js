@@ -11,6 +11,7 @@ const wss = new WebSocket.Server({ server });
 
 const users = new Map();
 const messages = [];
+const privateMessages = new Map();
 
 function broadcast(message) {
   wss.clients.forEach((client) => {
@@ -26,8 +27,20 @@ function sendToClient(client, message) {
   }
 }
 
+function getClientByUsername(username) {
+  for (const [clientId, name] of users.entries()) {
+    if (name === username) {
+      return Array.from(wss.clients).find(
+        (client) => client.clientId === clientId
+      );
+    }
+  }
+  return null;
+}
+
 wss.on("connection", (ws) => {
   const clientId = Math.random().toString(36).substr(2, 9);
+  ws.clientId = clientId;
   console.log("New client connected:", clientId);
 
   ws.on("message", (message) => {
@@ -58,6 +71,65 @@ wss.on("connection", (ws) => {
         broadcast({
           type: "chat_message",
           message: messageToSend,
+        });
+        break;
+
+      case "private_message":
+        const sender = users.get(clientId) || "Anonymous";
+        const recipient = data.recipient;
+        const privateMessageToSend = {
+          text: data.text,
+          sender: sender,
+          recipient: recipient,
+          timestamp: new Date().toISOString(),
+        };
+
+        // Store private message history
+        if (!privateMessages.has(sender)) {
+          privateMessages.set(sender, new Map());
+        }
+        if (!privateMessages.get(sender).has(recipient)) {
+          privateMessages.get(sender).set(recipient, []);
+        }
+        privateMessages.get(sender).get(recipient).push(privateMessageToSend);
+
+        // Send to recipient
+        const recipientClient = getClientByUsername(recipient);
+        if (recipientClient) {
+          sendToClient(recipientClient, {
+            type: "private_message",
+            message: privateMessageToSend,
+          });
+        }
+
+        // Send back to sender
+        sendToClient(ws, {
+          type: "private_message",
+          message: privateMessageToSend,
+        });
+        break;
+
+      case "get_private_history":
+        const user1 = users.get(clientId);
+        const user2 = data.otherUser;
+        let history = [];
+        if (
+          privateMessages.has(user1) &&
+          privateMessages.get(user1).has(user2)
+        ) {
+          history = privateMessages.get(user1).get(user2);
+        }
+        if (
+          privateMessages.has(user2) &&
+          privateMessages.get(user2).has(user1)
+        ) {
+          history = history.concat(privateMessages.get(user2).get(user1));
+        }
+        history.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+        sendToClient(ws, {
+          type: "private_history",
+          history: history,
+          otherUser: user2,
         });
         break;
 
