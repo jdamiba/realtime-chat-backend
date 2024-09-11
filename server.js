@@ -118,6 +118,7 @@ wss.on("connection", (ws, req) => {
             console.log("Recipient not found:", recipient);
           }
 
+          // Send the message back to the sender (for their own chat window)
           sendToClient(ws, {
             type: "private_message",
             message: privateMessageToSend,
