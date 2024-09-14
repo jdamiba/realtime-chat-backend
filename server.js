@@ -1,219 +1,318 @@
 require("dotenv").config();
 const express = require("express");
 const http = require("http");
-const WebSocket = require("ws");
-const cors = require("cors");
-const bcrypt = require("bcryptjs");
+const { Server } = require("socket.io");
 const jwt = require("jsonwebtoken");
+const bcrypt = require("bcryptjs");
+const cors = require("cors");
 const { sql } = require("@vercel/postgres");
 
 const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: process.env.CLIENT_URL || "http://localhost:3000",
+    methods: ["GET", "POST"],
+  },
+});
+
 app.use(cors());
 app.use(express.json());
 
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+// Keep track of connected users
+const connectedUsers = new Map();
 
-// Middleware to verify JWT
-const verifyToken = (req, res, next) => {
-  const token = req.headers["authorization"];
-  if (!token)
-    return res.status(403).send({ auth: false, message: "No token provided." });
+// Add this helper function at the top of your file
+function log(message, data = "") {
+  console.log(`[${new Date().toISOString()}] ${message}`, data);
+}
+
+// Middleware to authenticate socket connections
+io.use((socket, next) => {
+  const token = socket.handshake.auth.token;
+  log("Socket authentication attempt", { socketId: socket.id });
+  if (!token) {
+    log("Socket authentication failed: No token provided", {
+      socketId: socket.id,
+    });
+    return next(new Error("Authentication error"));
+  }
 
   jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-    if (err)
-      return res
-        .status(500)
-        .send({ auth: false, message: "Failed to authenticate token." });
+    if (err) {
+      log("Socket authentication failed: Invalid token", {
+        socketId: socket.id,
+        error: err.message,
+      });
+      return next(new Error("Authentication error"));
+    }
+    socket.userId = decoded.id;
+    socket.username = decoded.username;
+    log("Socket authenticated successfully", {
+      socketId: socket.id,
+      userId: socket.userId,
+      username: socket.username,
+    });
+    next();
+  });
+});
 
-    req.userId = decoded.id;
+io.on("connection", (socket) => {
+  log("New socket connection", {
+    socketId: socket.id,
+    username: socket.username,
+  });
+
+  if (!connectedUsers.has(socket.userId)) {
+    connectedUsers.set(socket.userId, {
+      username: socket.username,
+      connections: new Set(),
+    });
+    log("New user connected", {
+      userId: socket.userId,
+      username: socket.username,
+    });
+    broadcastUserList();
+  }
+  connectedUsers.get(socket.userId).connections.add(socket);
+  log("User connection added", {
+    userId: socket.userId,
+    connectionsCount: connectedUsers.get(socket.userId).connections.size,
+  });
+
+  socket.join("main");
+  log("User joined main room", {
+    socketId: socket.id,
+    username: socket.username,
+  });
+
+  sendChatHistory(socket);
+
+  socket.on("chat_message", (message) => {
+    log("Received chat message", { from: socket.username, message });
+    const messageData = {
+      username: socket.username,
+      text: message,
+      timestamp: new Date(),
+    };
+    io.to("main").emit("chat_message", messageData);
+    log("Broadcasted chat message", messageData);
+    saveChatMessage(messageData);
+  });
+
+  socket.on("private_message", ({ recipient, text }) => {
+    log("Received private message", {
+      from: socket.username,
+      to: recipient,
+      message: text,
+    });
+    const messageData = {
+      sender: socket.username,
+      recipient,
+      text,
+      timestamp: new Date(),
+    };
+    const recipientSocket = findSocketByUsername(recipient);
+    if (recipientSocket) {
+      recipientSocket.emit("private_message", messageData);
+      socket.emit("private_message", messageData);
+      log("Sent private message", messageData);
+    } else {
+      log("Failed to send private message: Recipient not found", { recipient });
+    }
+  });
+
+  socket.on("disconnect", () => {
+    log("User disconnected", {
+      socketId: socket.id,
+      username: socket.username,
+    });
+    const user = connectedUsers.get(socket.userId);
+    if (user) {
+      user.connections.delete(socket);
+      log("User connection removed", {
+        userId: socket.userId,
+        remainingConnections: user.connections.size,
+      });
+      if (user.connections.size === 0) {
+        connectedUsers.delete(socket.userId);
+        log("User fully disconnected", {
+          userId: socket.userId,
+          username: user.username,
+        });
+        broadcastUserList();
+      }
+    }
+  });
+});
+
+function broadcastUserList() {
+  const userList = Array.from(connectedUsers.values()).map(
+    (user) => user.username
+  );
+  io.emit("user_list", userList);
+  log("Broadcasted updated user list", userList);
+}
+
+function findSocketByUsername(username) {
+  for (const [, user] of connectedUsers) {
+    if (user.username === username) {
+      return Array.from(user.connections)[0];
+    }
+  }
+  return null;
+}
+
+async function sendChatHistory(socket) {
+  try {
+    const result =
+      await sql`SELECT * FROM messages ORDER BY timestamp DESC LIMIT 50`;
+    const messages = result.rows.reverse();
+    socket.emit("chat_history", messages);
+    log("Sent chat history to user", { socketId: socket.id, messages });
+  } catch (error) {
+    console.error("Error fetching chat history:", error);
+  }
+}
+
+async function saveChatMessage(message) {
+  try {
+    await sql`INSERT INTO messages (username, text, timestamp) VALUES (${message.username}, ${message.text}, ${message.timestamp})`;
+    log("Saved chat message", message);
+  } catch (error) {
+    console.error("Error saving chat message:", error);
+  }
+}
+
+// Authentication middleware
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1];
+
+  if (token == null) return res.sendStatus(401);
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) return res.sendStatus(403);
+    req.user = user;
     next();
   });
 };
 
 // Registration route
 app.post("/register", async (req, res) => {
+  log("Registration attempt", { username: req.body.username });
   try {
     const hashedPassword = await bcrypt.hash(req.body.password, 8);
-
     const result = await sql`
-      INSERT INTO users (username, password, role)
-      VALUES (${req.body.username}, ${hashedPassword}, ${
-      req.body.role || "user"
-    })
-      RETURNING id, username, role
+      INSERT INTO users (username, password, role, created_at)
+      VALUES (${req.body.username}, ${hashedPassword}, 'user', CURRENT_TIMESTAMP)
+      RETURNING id, username, role, created_at
     `;
+    console.log("Registration result:", result);
+    const newUser = result.rows[0];
+    log("User registered successfully", {
+      userId: newUser.id,
+      username: newUser.username,
+      role: newUser.role,
+    });
     res
       .status(201)
-      .send({ message: "User registered successfully", user: result[0] });
+      .json({ message: "User registered successfully", user: newUser });
   } catch (error) {
     if (error.code === "23505") {
       // unique_violation error code
-      res.status(400).send({ message: "Username already exists" });
+      log("Registration failed: Username already exists", {
+        username: req.body.username,
+      });
+      res.status(400).json({ message: "Username already exists" });
     } else {
-      console.error(error);
-      res.status(500).send({ message: "Error registering user" });
+      log("Registration error", { error: error.message });
+      res.status(500).json({ message: "Error registering user" });
     }
   }
 });
 
 // Login route
 app.post("/login", async (req, res) => {
+  log("Login attempt", { username: req.body.username });
   try {
-    console.log("Login attempt for username:", req.body.username);
     const result =
       await sql`SELECT * FROM users WHERE username = ${req.body.username}`;
-    console.log("Query result:", result);
 
     if (result.rowCount === 0) {
-      console.log("No user found with username:", req.body.username);
-      return res.status(404).send({ message: "User not found" });
+      log("Login failed: User not found", { username: req.body.username });
+      return res.status(404).json({ message: "User not found" });
     }
 
     const user = result.rows[0];
     console.log("User found:", user);
 
-    const isValidPassword = await bcrypt.compare(
+    const validPassword = await bcrypt.compare(
       req.body.password,
       user.password
     );
-    console.log("Password valid:", isValidPassword);
+    console.log("Password valid:", validPassword);
 
-    if (!isValidPassword)
-      return res.status(401).send({ auth: false, token: null });
+    if (!validPassword) {
+      log("Login failed: Invalid password", { username: req.body.username });
+      return res.status(401).json({ message: "Invalid password" });
+    }
 
     const token = jwt.sign(
-      { id: user.id, role: user.role },
+      { id: user.id, username: user.username, role: user.role },
       process.env.JWT_SECRET,
-      {
-        expiresIn: 86400, // expires in 24 hours
-      }
+      { expiresIn: "24h" }
     );
 
     // Update last_login
     await sql`UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ${user.id}`;
 
-    res.status(200).send({
-      auth: true,
-      token: token,
+    log("User logged in successfully", {
+      userId: user.id,
+      username: user.username,
+      role: user.role,
+    });
+    res.json({
+      token,
       username: user.username,
       role: user.role,
     });
   } catch (error) {
-    console.error("Login error:", error);
-    res.status(500).send({ message: "Error on the server." });
+    log("Login error", { error: error.message });
+    res.status(500).json({ message: "Error logging in" });
   }
 });
 
 // Protected route example
-app.get("/me", verifyToken, async (req, res) => {
+app.get("/profile", authenticateToken, async (req, res) => {
   try {
     const result =
-      await sql`SELECT id, username, role FROM users WHERE id = ${req.userId}`;
-    const user = result[0];
-    if (!user) return res.status(404).send({ message: "No user found." });
-    res.status(200).send(user);
+      await sql`SELECT id, username FROM users WHERE id = ${req.user.id}`;
+    res.json(result[0]);
   } catch (error) {
     console.error(error);
-    res.status(500).send({ message: "There was a problem finding the user." });
+    res.status(500).json({ message: "Error fetching profile" });
   }
 });
 
-// WebSocket connection handler
-wss.on("connection", (ws, req) => {
-  const token = new URL(req.url, "http://localhost").searchParams.get("token");
+// Reset connections (for development purposes)
+app.post("/reset-connections", (req, res) => {
+  const adminSecret = req.headers["admin-secret"];
 
-  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-    if (err) {
-      ws.close();
-      return;
-    }
+  if (adminSecret !== process.env.ADMIN_SECRET) {
+    return res.status(403).json({ message: "Unauthorized" });
+  }
 
-    ws.userId = decoded.id;
-    ws.username = decoded.username;
-    ws.role = decoded.role;
-
-    // Send the current user list to the new connection
-    const userList = Array.from(wss.clients)
-      .filter((client) => client.username)
-      .map((client) => client.username);
-    ws.send(JSON.stringify({ type: "user_list", users: userList }));
-
-    // Broadcast to all clients that a new user has joined
-    wss.clients.forEach((client) => {
-      if (client !== ws && client.readyState === WebSocket.OPEN) {
-        client.send(
-          JSON.stringify({
-            type: "user_joined",
-            username: ws.username,
-          })
-        );
-      }
-    });
-
-    ws.on("message", (message) => {
-      const data = JSON.parse(message);
-
-      switch (data.type) {
-        case "chat_message":
-          wss.clients.forEach((client) => {
-            if (client.readyState === WebSocket.OPEN) {
-              client.send(
-                JSON.stringify({
-                  type: "chat_message",
-                  message: {
-                    username: ws.username,
-                    text: data.text,
-                    timestamp: new Date(),
-                  },
-                })
-              );
-            }
-          });
-          break;
-
-        case "private_message":
-          const recipient = Array.from(wss.clients).find(
-            (client) => client.username === data.recipient
-          );
-          if (recipient) {
-            const messageData = {
-              type: "private_message",
-              message: {
-                sender: ws.username,
-                recipient: data.recipient,
-                text: data.text,
-                timestamp: new Date(),
-              },
-            };
-            recipient.send(JSON.stringify(messageData));
-            ws.send(JSON.stringify(messageData)); // Send to sender as well
-          }
-          break;
-
-        case "get_private_history":
-          // Implement fetching private chat history from the database
-          break;
-      }
-    });
-
-    ws.on("close", () => {
-      // Broadcast to all clients that a user has left
-      wss.clients.forEach((client) => {
-        if (client !== ws && client.readyState === WebSocket.OPEN) {
-          client.send(
-            JSON.stringify({
-              type: "user_left",
-              username: ws.username,
-            })
-          );
-        }
-      });
-    });
+  io.sockets.sockets.forEach((socket) => {
+    socket.disconnect(true);
   });
+
+  connectedUsers.clear();
+
+  res.json({ message: "All connections reset" });
 });
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+  log(`Server running on port ${PORT}`);
 });
